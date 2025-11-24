@@ -9,7 +9,6 @@ on:
 jobs:
   macos-arm64:
     runs-on: macos-14
-
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
 
@@ -22,11 +21,10 @@ jobs:
           python-version: "3.11"
           architecture: "arm64"
 
-      - name: Install Homebrew Tcl/Tk (provides tcl8.6 / tk8.6 + dylibs)
+      - name: Install Homebrew Tcl/Tk (provides tcl/tk scripts + dylibs)
         run: |
           brew install tcl-tk
-          brew --prefix tcl-tk
-          ls -la "$(brew --prefix tcl-tk)"/lib | sed -n '1,120p'
+          echo "BREW_PREFIX=$(brew --prefix tcl-tk)" >> $GITHUB_ENV
 
       - name: Install build deps
         run: |
@@ -34,58 +32,87 @@ jobs:
           pip install pyinstaller==6.10.0
           pip install -r requirements.txt
 
-      - name: Locate Tcl/Tk (python.org, system frameworks, or Homebrew)
+      - name: Locate Tcl/Tk (8.x), tolerant to 8.6 or 8.7
         id: tcltk
         run: |
           python - <<'PY'
-          import json, pathlib, tkinter, subprocess
+          import json, pathlib, sys, subprocess, glob, tkinter
 
           tried = []
+          def record(a,b): tried.append((str(a), str(b)))
 
-          def ok(p): return p.is_dir()
+          def pick_pair(base):
+            # choose highest tcl8.* and tk8.* under base
+            tcls = sorted(pathlib.Path(base).glob("tcl8.*"))
+            tks  = sorted(pathlib.Path(base).glob("tk8.*"))
+            if tcls and tks:
+              return tcls[-1], tks[-1]
+            return None, None
 
-          # 1) python.org style
-          root = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
-          tcl = root / "tcl8.6"
-          tk  = root / "tk8.6"
-          tried.append((str(tcl), str(tk)))
-          if ok(tcl) and ok(tk):
-              out = {"tcl8": str(tcl), "tk8": str(tk), "dylib_dir": ""}
+          # 1) python.org-style: .../tcl
+          tclroot = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
+          tcl, tk = pick_pair(tclroot)
+          record(tclroot / "tcl8.*", tclroot / "tk8.*")
+          if tcl and tk:
+            out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": ""}
+            pathlib.Path("tcltk.json").write_text(json.dumps(out))
+            sys.exit(0)
+
+          # 2) System Frameworks (Scripts inside frameworks)
+          sys_tcl_base = pathlib.Path("/Library/Frameworks/Tcl.framework/Versions")
+          sys_tk_base  = pathlib.Path("/Library/Frameworks/Tk.framework/Versions")
+          if sys_tcl_base.is_dir() and sys_tk_base.is_dir():
+            # pick highest 8.*
+            tcl_ver_dirs = sorted(sys_tcl_base.glob("8.*"))
+            tk_ver_dirs  = sorted(sys_tk_base.glob("8.*"))
+            if tcl_ver_dirs and tk_ver_dirs:
+              tcl = tcl_ver_dirs[-1] / "Resources" / "Scripts"
+              tk  = tk_ver_dirs[-1]  / "Resources" / "Scripts"
+              tcl, tk = pick_pair(tcl), pick_pair(tk)
+              # pick_pair returns tuple; flatten
+              tcl = tcl[0] if isinstance(tcl, tuple) else tcl
+              tk  = tk[1]  if isinstance(tk, tuple) else tk
+          record(sys_tcl_base/"*/Resources/Scripts/tcl8.*", sys_tk_base/"*/Resources/Scripts/tk8.*")
+          if tcl and tk:
+            out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": "/Library/Frameworks"}
+            pathlib.Path("tcltk.json").write_text(json.dumps(out))
+            sys.exit(0)
+
+          # 3) Homebrew
+          try:
+            prefix = subprocess.check_output(["brew","--prefix","tcl-tk"], text=True).strip()
+          except Exception:
+            prefix = ""
+          if prefix:
+            brew_lib = pathlib.Path(prefix) / "lib"
+            record(brew_lib/"tcl8.*", brew_lib/"tk8.*")
+            tcl, tk = pick_pair(brew_lib)
+            if tcl and tk:
+              out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": str(brew_lib)}
               pathlib.Path("tcltk.json").write_text(json.dumps(out))
-              raise SystemExit(0)
+              sys.exit(0)
 
-          # 2) System frameworks
-          tcl = pathlib.Path("/Library/Frameworks/Tcl.framework/Versions/8.6/Resources/Scripts/tcl8.6")
-          tk  = pathlib.Path("/Library/Frameworks/Tk.framework/Versions/8.6/Resources/Scripts/tk8.6")
-          tried.append((str(tcl), str(tk)))
-          if ok(tcl) and ok(tk):
-              out = {"tcl8": str(tcl), "tk8": str(tk), "dylib_dir": "/Library/Frameworks"}
-              pathlib.Path("tcltk.json").write_text(json.dumps(out))
-              raise SystemExit(0)
-
-          # 3) Homebrew tcl-tk
-          prefix = subprocess.check_output(["brew","--prefix","tcl-tk"], text=True).strip()
-          tcl = pathlib.Path(prefix) / "lib" / "tcl8.6"
-          tk  = pathlib.Path(prefix) / "lib" / "tk8.6"
-          tried.append((str(tcl), str(tk)))
-          if ok(tcl) and ok(tk):
-              out = {"tcl8": str(tcl), "tk8": str(tk), "dylib_dir": str(pathlib.Path(prefix)/"lib")}
-              pathlib.Path("tcltk.json").write_text(json.dumps(out))
-              raise SystemExit(0)
-
-          msg = "Tcl/Tk 8.6 not found. Tried:\n" + "\n".join([f"TCL={a}  TK={b}" for a,b in tried])
+          msg = "Tcl/Tk 8.x not found. Tried:\n" + "\n".join([f"TCL={a}  TK={b}" for a,b in tried])
           raise SystemExit(msg)
           PY
 
       - name: Build .app with PyInstaller (bundle Tcl/Tk scripts + dylibs)
         run: |
-          TCL8=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl8"])')
-          TK8=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk8"])')
+          TCLDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl_dir"])')
+          TKDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk_dir"])')
           DYDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["dylib_dir"])')
 
-          ADD_BINARIES=""
-          if [ -n "$DYDIR" ] && [ -f "$DYDIR/libtcl8.6.dylib" ] && [ -f "$DYDIR/libtk8.6.dylib" ]; then
-            ADD_BINARIES="--add-binary \"$DYDIR/libtcl8.6.dylib:.\" --add-binary \"$DYDIR/libtk8.6.dylib:.\""
+          TCLBASE=$(basename "$TCLDIR")
+          TKBASE=$(basename "$TKDIR")
+
+          ADD_DYLIBS=""
+          # copy dylibs when we know where they are (Frameworks or Homebrew lib)
+          if [ -n "$DYDIR" ]; then
+            for L in libtcl*.dylib libtk*.dylib; do
+              if [ -f "$DYDIR/$L" ]; then
+                ADD_DYLIBS="$ADD_DYLIBS --add-binary \"$DYDIR/$L:.\""
+              fi
+            done
           fi
 
           eval pyinstaller --noconfirm --windowed --name "FDACombo" \
@@ -94,9 +121,9 @@ jobs:
             --collect-all openpyxl \
             --hidden-import=tkinter \
             --hidden-import=_tkinter \
-            --add-data "\"$TCL8:tcl8.6\"" \
-            --add-data "\"$TK8:tk8.6\"" \
-            $ADD_BINARIES \
+            --add-data "\"$TCLDIR:$TCLBASE\"" \
+            --add-data "\"$TKDIR:$TKBASE\"" \
+            $ADD_DYLIBS \
             main.py
 
           file "dist/FDACombo.app/Contents/MacOS/FDACombo"
