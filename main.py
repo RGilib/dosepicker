@@ -7,6 +7,7 @@ from typing import Optional, List, Tuple, Dict
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
+import sys, os
 
 ALLOWED_ANY_DATA = [("Data files", "*.csv *.tsv *.xlsx *.xls *.json"), ("All files", "*.*")]
 if getattr(sys, "frozen", False) and sys.platform == "darwin":
