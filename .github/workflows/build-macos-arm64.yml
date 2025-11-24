@@ -1,13 +1,14 @@
+# .github/workflows/build-macos-arm64.yml
 name: Build macOS arm64 app
 
 on:
-  workflow_dispatch:        # allow manual "Run workflow"
+  workflow_dispatch:        # manual "Run workflow"
   push:
-    tags: ["v*"]            # also build when you create a tag like v1.0.0
+    tags: ["v*"]            # build when you tag e.g. v1.0.0
 
 jobs:
   macos-arm64:
-    # Apple Silicon runner (arm64). macos-14/15 map to Apple Silicon as of 2025.
+    # Apple Silicon runner (arm64). macos-14/15 are Apple Silicon.
     runs-on: macos-14
 
     steps:
@@ -22,19 +23,46 @@ jobs:
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
+          # pin a known-good PyInstaller on macOS 14 arm64
+          pip install pyinstaller==6.10.0
           pip install -r requirements.txt
 
-      - name: Build .app with PyInstaller
+      - name: Locate Tcl/Tk inside runner's Python (for Tkinter)
+        id: tcltk
         run: |
+          python - <<'PY'
+          import tkinter, pathlib, json
+          root = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
+          tcl = (root / "tcl8.6").resolve()
+          tk  = (root / "tk8.6").resolve()
+          print("TCL:", tcl)
+          print("TK :", tk)
+          pathlib.Path("tcltk.json").write_text(
+              json.dumps({"tcl": str(tcl), "tk": str(tk)})
+          )
+          PY
+
+      - name: Build .app with PyInstaller (bundle Tcl/Tk)
+        run: |
+          TCL=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl"])')
+          TK=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk"])')
+
           pyinstaller --windowed --name "FDACombo" \
             --icon a9qqs-dnvbm.icns \
-            --collect-all pandas --collect-all openpyxl \
+            --collect-all pandas \
+            --collect-all openpyxl \
+            --hidden-import=tkinter \
+            --hidden-import=_tkinter \
+            --add-data "$TCL:tcl8.6" \
+            --add-data "$TK:tk8.6" \
             main.py
+
           file "dist/FDACombo.app/Contents/MacOS/FDACombo"
 
       - name: Ad-hoc sign (no Apple ID needed)
         run: |
-          codesign --deep --force --sign - "dist/FDACombo.app"
+          codesign --deep --force --options runtime --sign - "dist/FDACombo.app"
+          codesign -vvv --deep --strict --verify "dist/FDACombo.app"
 
       - name: Zip the app for download
         run: |
@@ -46,4 +74,3 @@ jobs:
         with:
           name: FDACombo-mac-arm64
           path: FDACombo-mac-arm64.zip
-
