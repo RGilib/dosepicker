@@ -1,145 +1,58 @@
-# .github/workflows/build-macos-arm64.yml
 name: Build macOS arm64 app
 
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    tags:
+      - 'v*'
 
 jobs:
-  macos-arm64:
+  build-arm64:
     runs-on: macos-14
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 (arm64)
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          architecture: "arm64"
+          python-version: '3.11'
 
-      - name: Install Homebrew Tcl/Tk (provides tcl/tk scripts + dylibs)
-        run: |
-          brew install tcl-tk
-          echo "BREW_PREFIX=$(brew --prefix tcl-tk)" >> $GITHUB_ENV
-
-      - name: Install build deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller==6.10.0
-          pip install -r requirements.txt
+          # aggiungi qui altri pacchetti python se il tuo script li usa
+          pip install pyinstaller pandas openpyxl
 
-      - name: Locate Tcl/Tk (8.x), tolerant to 8.6 or 8.7
-        id: tcltk
+      - name: Build .app (arm64) con icona
         run: |
-          python - <<'PY'
-          import json, pathlib, sys, subprocess, glob, tkinter
+          APP_NAME="FDA_tabulation"
+          ICON_PATH="a9qqs-dnvbm.icns"
 
-          tried = []
-          def record(a,b): tried.append((str(a), str(b)))
+          # fallisci presto se l'icona non c'è
+          test -f "$ICON_PATH"
 
-          def pick_pair(base):
-            # choose highest tcl8.* and tk8.* under base
-            tcls = sorted(pathlib.Path(base).glob("tcl8.*"))
-            tks  = sorted(pathlib.Path(base).glob("tk8.*"))
-            if tcls and tks:
-              return tcls[-1], tks[-1]
-            return None, None
-
-          # 1) python.org-style: .../tcl
-          tclroot = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
-          tcl, tk = pick_pair(tclroot)
-          record(tclroot / "tcl8.*", tclroot / "tk8.*")
-          if tcl and tk:
-            out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": ""}
-            pathlib.Path("tcltk.json").write_text(json.dumps(out))
-            sys.exit(0)
-
-          # 2) System Frameworks (Scripts inside frameworks)
-          sys_tcl_base = pathlib.Path("/Library/Frameworks/Tcl.framework/Versions")
-          sys_tk_base  = pathlib.Path("/Library/Frameworks/Tk.framework/Versions")
-          if sys_tcl_base.is_dir() and sys_tk_base.is_dir():
-            # pick highest 8.*
-            tcl_ver_dirs = sorted(sys_tcl_base.glob("8.*"))
-            tk_ver_dirs  = sorted(sys_tk_base.glob("8.*"))
-            if tcl_ver_dirs and tk_ver_dirs:
-              tcl = tcl_ver_dirs[-1] / "Resources" / "Scripts"
-              tk  = tk_ver_dirs[-1]  / "Resources" / "Scripts"
-              tcl, tk = pick_pair(tcl), pick_pair(tk)
-              # pick_pair returns tuple; flatten
-              tcl = tcl[0] if isinstance(tcl, tuple) else tcl
-              tk  = tk[1]  if isinstance(tk, tuple) else tk
-          record(sys_tcl_base/"*/Resources/Scripts/tcl8.*", sys_tk_base/"*/Resources/Scripts/tk8.*")
-          if tcl and tk:
-            out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": "/Library/Frameworks"}
-            pathlib.Path("tcltk.json").write_text(json.dumps(out))
-            sys.exit(0)
-
-          # 3) Homebrew
-          try:
-            prefix = subprocess.check_output(["brew","--prefix","tcl-tk"], text=True).strip()
-          except Exception:
-            prefix = ""
-          if prefix:
-            brew_lib = pathlib.Path(prefix) / "lib"
-            record(brew_lib/"tcl8.*", brew_lib/"tk8.*")
-            tcl, tk = pick_pair(brew_lib)
-            if tcl and tk:
-              out = {"tcl_dir": str(tcl), "tk_dir": str(tk), "dylib_dir": str(brew_lib)}
-              pathlib.Path("tcltk.json").write_text(json.dumps(out))
-              sys.exit(0)
-
-          msg = "Tcl/Tk 8.x not found. Tried:\n" + "\n".join([f"TCL={a}  TK={b}" for a,b in tried])
-          raise SystemExit(msg)
-          PY
-
-      - name: Build .app with PyInstaller (bundle Tcl/Tk scripts + dylibs)
-        run: |
-          TCLDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl_dir"])')
-          TKDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk_dir"])')
-          DYDIR=$(python -c 'import json; print(json.load(open("tcltk.json"))["dylib_dir"])')
-
-          TCLBASE=$(basename "$TCLDIR")
-          TKBASE=$(basename "$TKDIR")
-
-          ADD_DYLIBS=""
-          # copy dylibs when we know where they are (Frameworks or Homebrew lib)
-          if [ -n "$DYDIR" ]; then
-            for L in libtcl*.dylib libtk*.dylib; do
-              if [ -f "$DYDIR/$L" ]; then
-                ADD_DYLIBS="$ADD_DYLIBS --add-binary \"$DYDIR/$L:.\""
-              fi
-            done
-          fi
-
-          eval pyinstaller --noconfirm --windowed --name "FDACombo" \
-            --icon a9qqs-dnvbm.icns \
-            --collect-all pandas \
-            --collect-all openpyxl \
-            --hidden-import=tkinter \
-            --hidden-import=_tkinter \
-            --add-data "\"$TCLDIR:$TCLBASE\"" \
-            --add-data "\"$TKDIR:$TKBASE\"" \
-            $ADD_DYLIBS \
+          pyinstaller --windowed --name "$APP_NAME" \
+            --icon "$ICON_PATH" \
+            --collect-all pandas --collect-all openpyxl \
             main.py
 
-          file "dist/FDACombo.app/Contents/MacOS/FDACombo"
+          echo "Controllo architettura binario:"
+          file "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 
-      - name: Ad-hoc sign (no Apple ID needed)
+      - name: Ad-hoc sign (no Apple ID)
         run: |
-          codesign --deep --force --options runtime --sign - "dist/FDACombo.app"
-          codesign -vvv --deep --strict --verify "dist/FDACombo.app"
+          APP_NAME="FDA_tabulation"
+          codesign --deep --force --sign - "dist/$APP_NAME.app" || true
 
-      - name: Zip the app for download
+      - name: Zip app bundle
         run: |
+          APP_NAME="FDA_tabulation"
           ditto -c -k --sequesterRsrc --keepParent \
-            "dist/FDACombo.app" "FDACombo-mac-arm64.zip"
+            "dist/$APP_NAME.app" "$APP_NAME-mac-arm64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FDACombo-mac-arm64
-          path: FDACombo-mac-arm64.zip
+          name: FDA_tabulation-mac-arm64
+          path: FDA_tabulation-mac-arm64.zip
