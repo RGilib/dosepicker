@@ -10,13 +10,17 @@ from openpyxl.utils import get_column_letter
 import sys, os
 
 ALLOWED_ANY_DATA = [("Data files", "*.csv *.tsv *.xlsx *.xls *.json"), ("All files", "*.*")]
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
 if getattr(sys, "frozen", False) and sys.platform == "darwin":
-    meipass = sys._MEIPASS
-    tcl = os.path.join(meipass, "tcl8.6")
-    tk  = os.path.join(meipass, "tk8.6")
-    if os.path.isdir(tcl) and os.path.isdir(tk):
-        os.environ["TCL_LIBRARY"] = tcl
-        os.environ["TK_LIBRARY"]  = tk
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        tcl = os.path.join(meipass, "tcl8.6")
+        tkp = os.path.join(meipass, "tk8.6")
+        if os.path.isdir(tcl) and os.path.isdir(tkp):
+            os.environ.setdefault("TCL_LIBRARY", tcl)
+            os.environ.setdefault("TK_LIBRARY",  tkp)
+
 # ----------------- header/IO helpers -----------------
 def normalize_header(name: str) -> str:
     s = str(name).replace("\u00A0", " ")
