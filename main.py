@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Nov 21 08:31:34 2025
-
-@author: giliberr@menarini.net
-"""
-
 # main.py
 import os, re
 import tkinter as tk
@@ -17,15 +9,6 @@ from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 ALLOWED_ANY_DATA = [("Data files", "*.csv *.tsv *.xlsx *.xls *.json"), ("All files", "*.*")]
-# ---- PyInstaller + Tk on macOS: ensure Tcl/Tk paths inside the .app ----
-import sys, os
-if getattr(sys, "frozen", False) and sys.platform == "darwin":
-    meipass = sys._MEIPASS  # created by PyInstaller at runtime
-    tcl = os.path.join(meipass, "tcl8.6")
-    tk  = os.path.join(meipass, "tk8.6")
-    if os.path.isdir(tcl) and os.path.isdir(tk):
-        os.environ["TCL_LIBRARY"] = tcl
-        os.environ["TK_LIBRARY"]  = tk
 
 # ----------------- header/IO helpers -----------------
 def normalize_header(name: str) -> str:
@@ -121,7 +104,7 @@ def has_valid_timepoint_nonbaseline(visit_series: pd.Series) -> bool:
     if visit_series is None or visit_series.empty:
         return False
     for v in visit_series.dropna():
-        if is_excluded_visit(v): 
+        if is_excluded_visit(v):
             continue
         if is_baseline(v):
             continue
@@ -130,6 +113,9 @@ def has_valid_timepoint_nonbaseline(visit_series: pd.Series) -> bool:
     return False
 
 def eligible_subjects(df: pd.DataFrame, subj_col: str, visit_col: str) -> set:
+    """
+    Subjects with baseline AND ≥1 non-baseline visit (we keep this global gate).
+    """
     tmp = df[[subj_col, visit_col]].copy()
     tmp["_KEY"] = tmp[subj_col].map(_keyize_id)
     tmp = tmp[tmp["_KEY"] != ""]
@@ -156,15 +142,15 @@ def cohorts_from_dose(dose_df: pd.DataFrame, col_patient: str, col_group: str, v
             out[str(grp)] = ordered
     return out
 
-def _cohort_sort_key(name: str):
-    m = re.search(r'(\d+)', str(name))
-    return (int(m.group(1)) if m else float('inf'), str(name).lower())
-
 def format_cohort_header(name: str) -> str:
     m = re.fullmatch(r"\s*tag\s*([0-9]+)\s*", name, flags=re.I)
     if m:
         return f"TAG {m.group(1)} mgc"
     return name
+
+def cohort_sort_key(name: str):
+    m = re.search(r"(\d+)", str(name))
+    return (int(m.group(1)) if m else 10**9, str(name).lower())
 
 def iqr(values: List[float]) -> Optional[Tuple[float, float]]:
     if not values: return None
@@ -179,53 +165,7 @@ def iqr(values: List[float]) -> Optional[Tuple[float, float]]:
         return vals[i-1] + f*(vals[i]-vals[i-1])
     return (round(_q(1),1), round(_q(3),1))
 
-# ----------------- visit ordering -----------------
-def build_ordered_visits(input_df: pd.DataFrame,
-                         col_subject: str,
-                         col_visit: str,
-                         col_bm: str,
-                         col_pb: str,
-                         col_cd123: str,
-                         ok_keys: set) -> list[str]:
-    """
-    Screening first (if any data). Then only visits with C#D# pattern,
-    ordered by (cycle, day). Drop timepoints with zero usable data
-    (no BM blasts and no BM*CD123 product across eligible subjects).
-    """
-    def _visit_has_data(visit_label: str) -> bool:
-        sub = input_df[~input_df[col_visit].map(is_excluded_visit)].copy()
-        sub = sub[sub[col_subject].map(_keyize_id).isin(ok_keys)]
-        sub = sub[sub[col_visit].astype(str).str.strip().str.lower() == _norm_visit(visit_label)]
-        has_bm = pd.to_numeric(sub[col_bm].map(_to_percent), errors="coerce").notna().any()
-        bm = pd.to_numeric(sub[col_bm].map(_to_percent), errors="coerce")
-        cd = pd.to_numeric(sub[col_cd123].map(_to_percent), errors="coerce")
-        prod = (bm * (cd/100.0))
-        has_prod = prod.notna().any()
-        return bool(has_bm or has_prod)
-
-    allowed = input_df[~input_df[col_visit].map(is_excluded_visit)][[col_visit]].dropna()
-    unique_visits = {str(v).strip() for v in allowed[col_visit].tolist()}
-
-    visit_list = []
-    if any(_norm_visit(v) in BASELINE_NAMES for v in unique_visits):
-        if _visit_has_data("Screening"):
-            visit_list.append("Screening")
-
-    coded = []
-    for v in unique_visits:
-        parsed = parse_cycle_day(v)
-        if parsed is None:
-            continue
-        if not _visit_has_data(v):
-            continue
-        cycle, day = parsed
-        coded.append((cycle, day, v))
-
-    coded.sort(key=lambda t: (t[0], t[1], t[2].lower()))
-    visit_list.extend([v for _, _, v in coded])
-    return visit_list
-
-# ----------------- mutation classification helpers -----------------
+# ----------------- mutation helpers -----------------
 def _detect_mut_and_vaf_cols(df: pd.DataFrame) -> Tuple[List[str], List[str], List[int]]:
     """
     Detect TP53DNA{n} and TP53VAF{n} actual column names and the sorted indices n.
@@ -250,18 +190,15 @@ def _cohort_mutations_df(input_df: pd.DataFrame,
                          col_visit: str,
                          dict_path: Optional[str]) -> pd.DataFrame:
     """
-    Build mutation table for given cohort keys, using your gating:
-      - subjects with ≥1 valid non-baseline C#D# visit
-      - include all rows for those subjects
-      - extract all (TP53DNAn, TP53VAFn) pairs, VAF as percent
-      - left-merge with TP53 dictionary (index_col=0) if provided
-    Output columns: ['mutation_id','vaf','Effect','Hotspot','_SUBJECT_KEY']
+    Build mutation dataframe for cohort keys using the user's 'to_check' logic.
+    Returns columns: ['mutation_id','vaf','Effect','Hotspot','_SUBJECT_KEY'].
     """
     if not keys:
         return pd.DataFrame(columns=["mutation_id","vaf","Effect","Hotspot","_SUBJECT_KEY"])
 
     sub = input_df[input_df[col_subject].map(_keyize_id).isin(keys)].copy()
     sub = sub[~sub[col_visit].map(is_excluded_visit)]
+
     keep_keys = set()
     for k, g in sub.groupby(sub[col_subject].map(_keyize_id)):
         if has_valid_timepoint_nonbaseline(g[col_visit]):
@@ -314,7 +251,7 @@ def _cohort_mutations_df(input_df: pd.DataFrame,
         if "Hotspot" not in merged.columns:
             merged["Hotspot"] = pd.NA
 
-    merged["Effect"]  = merged["Effect"].astype(str).str.replace("\u00A0"," ").str.strip().str.lower()
+    merged["Effect"] = merged["Effect"].astype(str).str.replace("\u00A0"," ").str.strip().str.lower()
     merged["Hotspot"] = merged["Hotspot"].astype(str).str.replace("\u00A0"," ").str.strip().str.lower()
     return merged
 
@@ -327,6 +264,51 @@ def _count_mean_text(df: pd.DataFrame, mask: pd.Series) -> str:
     mean_v = round(float(sub["vaf"].mean()), 1)
     return f"{len(sub)} ({mean_v}%)"
 
+# ----------------- visit ordering -----------------
+def build_ordered_visits(input_df: pd.DataFrame,
+                         col_subject: str,
+                         col_visit: str,
+                         col_bm: str,
+                         col_pb: str,
+                         col_cd123: str,
+                         ok_keys: set) -> list[str]:
+    """
+    Screening first (if any data). Then only C#D# visits ordered by (cycle,day).
+    Keep only timepoints that have data for BM or for BM*CD123 among eligible subjects.
+    """
+    def _visit_has_data(visit_label: str) -> bool:
+        sub = input_df[~input_df[col_visit].map(is_excluded_visit)].copy()
+        sub = sub[sub[col_subject].map(_keyize_id).isin(ok_keys)]
+        sub = sub[sub[col_visit].astype(str).str.strip().str.lower() == _norm_visit(visit_label)]
+        has_bm = pd.to_numeric(sub[col_bm].map(_to_percent), errors="coerce").notna().any()
+        bm = pd.to_numeric(sub[col_bm].map(_to_percent), errors="coerce")
+        cd = pd.to_numeric(sub[col_cd123].map(_to_percent), errors="coerce")
+        prod = (bm * (cd/100.0))
+        has_prod = prod.notna().any()
+        return bool(has_bm or has_prod)
+
+    allowed = input_df[~input_df[col_visit].map(is_excluded_visit)][[col_visit]].dropna()
+    unique_visits = {str(v).strip() for v in allowed[col_visit].tolist()}
+
+    visit_list = []
+    if any(_norm_visit(v) in BASELINE_NAMES for v in unique_visits):
+        if _visit_has_data("Screening"):
+            visit_list.append("Screening")
+
+    coded = []
+    for v in unique_visits:
+        parsed = parse_cycle_day(v)
+        if parsed is None:
+            continue
+        if not _visit_has_data(v):
+            continue
+        cycle, day = parsed
+        coded.append((cycle, day, v))
+
+    coded.sort(key=lambda t: (t[0], t[1], t[2].lower()))
+    visit_list.extend([v for _, _, v in coded])
+    return visit_list
+
 # ----------------- core generator -----------------
 def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Optional[str], out_path: str):
     input_df = read_table(input_path)
@@ -335,12 +317,10 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     col_subject = find_col(input_df, ["SUBJECT"]) or "SUBJECT"
     col_visit   = find_col(input_df, ["VISIT"])   or "VISIT"
     col_bm      = find_col(input_df, ["BMBLASTS","BM BLASTS"])
-    col_pb      = find_col(input_df, ["PBBLASTS","PB BLASTS"])  # not used for product
+    col_pb      = find_col(input_df, ["PBBLASTS","PB BLASTS"])  # unused in product
     col_cd123   = find_col(input_df, ["CD123"])
     if not col_bm or not col_cd123:
         raise ValueError("Missing required columns in INPUT: need BMBLASTS (or BM BLASTS) and CD123.")
-    if not col_pb:
-        col_pb = col_bm  # harmless fallback
 
     col_patient = find_col(dose_df, ["Patient Number"])
     col_group   = find_col(dose_df, ["Treatment Group"])
@@ -350,7 +330,9 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     # eligible subjects (baseline + ≥1 post-baseline; excluding Unscheduled/.)
     ok_keys = eligible_subjects(input_df, col_subject, col_visit)
     cohorts = cohorts_from_dose(dose_df, col_patient, col_group, valid_keys=ok_keys)
-    cohort_names = sorted(list(cohorts.keys()), key=_cohort_sort_key)
+
+    # sort cohorts numerically by the number inside the label (TAG 9, TAG 12, …)
+    cohort_names = sorted(list(cohorts.keys()), key=cohort_sort_key)
 
     # ordered visit list to display
     visit_list = build_ordered_visits(
@@ -358,7 +340,7 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
         col_subject=col_subject,
         col_visit=col_visit,
         col_bm=col_bm,
-        col_pb=col_pb,
+        col_pb=col_pb or col_bm,
         col_cd123=col_cd123,
         ok_keys=ok_keys,
     )
@@ -406,17 +388,28 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
                 best = max(best, base_mean / min_f)
         return "-" if best <= 0 else f"{round(best,1)}-fold reduction"
 
-    def mean_min_max_product(keys: set, visit_name: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        # PRODUCT = BM * CD123
+    # ----------- CD123+ BMB = BM * (CD123/100) -----------
+    def n_mean_min_max_product(keys: set, visit_name: str) -> Tuple[int, Optional[float], Optional[float], Optional[float]]:
+        """
+        Patient-level stats: for each subject at this visit, compute product BM*CD123,
+        then return (n unique subjects, mean%, min%, max%) across subjects.
+        """
         sub = input_df[~input_df[col_visit].map(is_excluded_visit)].copy()
         sub = sub[sub[col_subject].map(_keyize_id).isin(keys)]
         sub = sub[sub[col_visit].astype(str).str.strip().str.lower() == _norm_visit(visit_name)]
+        if sub.empty:
+            return (0, None, None, None)
+        sub["_KEY"] = sub[col_subject].map(_keyize_id)
         bm = pd.to_numeric(sub[col_bm].map(_to_percent), errors="coerce")
         cd = pd.to_numeric(sub[col_cd123].map(_to_percent), errors="coerce")
-        prod = (bm * (cd/100.0)).dropna()
-        if prod.empty:
-            return (None, None, None)
-        return (round(prod.mean(),1), round(prod.min(),1), round(prod.max(),1))
+        prod = (bm * (cd/100.0))
+        sub = sub.assign(PROD=prod)
+        # per-subject mean at this visit
+        s = sub.groupby("_KEY")["PROD"].mean().dropna()
+        if s.empty:
+            return (0, None, None, None)
+        n = int(s.shape[0])
+        return (n, round(float(s.mean()),1), round(float(s.min()),1), round(float(s.max()),1))
 
     def max_fold_reduction_product(keys: set) -> str:
         df = input_df[~input_df[col_visit].map(is_excluded_visit)].copy()
@@ -456,7 +449,7 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     ws["B3"].value = "PD Assessment"
     ws["B3"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # Cohort headers + Overall (sorted by TAG number)
+    # Cohort headers + Overall (each merged over rows 3-4)
     cols = []
     start_col = 4
     for i, grp in enumerate(cohort_names):
@@ -477,6 +470,7 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     ws["B5"].value = "Frequency of BMB  % and range (IQR)"
     ws["B5"].alignment = Alignment(horizontal="center")
 
+    # visits appear in column C from row 6 downward
     for i, v in enumerate(visit_list, start=6):
         ws.cell(row=i, column=3, value=str(v))
         for col_idx, grp in zip(cols, cohort_names + ["__OVERALL__"]):
@@ -508,21 +502,26 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     row_max_bm_fold = row_max_bm_title + 1
     ws.merge_cells(start_row=row_max_bm_fold, start_column=2, end_row=row_max_bm_fold, end_column=3)
     ws.cell(row=row_max_bm_fold, column=2, value="fold change")
+
     for col_idx, grp in zip(cols, cohort_names + ["__OVERALL__"]):
         keys = ok_keys if grp == "__OVERALL__" else set(cohorts[grp])
         ws.cell(row=row_max_bm_fold, column=col_idx, value=max_fold_reduction_bm(keys)).alignment = Alignment(horizontal="center")
 
-    # Section 2: CD123+ BMB (BM*CD123)
+    # Section 2: CD123+ BMB (BM*CD123) — NOW WITH n=PATIENTS
     row_cd_title = row_max_bm_fold + 1
     ws.merge_cells(start_row=row_cd_title, start_column=2, end_row=row_cd_title, end_column=3)
     ws.cell(row=row_cd_title, column=2, value="Frequency of CD123+ BMB (%, range)")
+    ws.cell(row=row_cd_title, column=2).alignment = Alignment(horizontal="center")
 
     for i, v in enumerate(visit_list, start=row_cd_title+1):
         ws.cell(row=i, column=3, value=str(v))
         for col_idx, grp in zip(cols, cohort_names + ["__OVERALL__"]):
             keys = ok_keys if grp == "__OVERALL__" else set(cohorts[grp])
-            m, mn, mx = mean_min_max_product(keys, v)
-            text = "-" if m is None else f"{m}%\n({mn}–{mx})"
+            n, m, mn, mx = n_mean_min_max_product(keys, v)
+            if n == 0 or m is None:
+                text = "n=0"
+            else:
+                text = f"n={n}\n{m}%\n({mn}–{mx})"
             ws.cell(row=i, column=col_idx, value=text).alignment = Alignment(wrap_text=True, vertical="top")
 
     # Max fold change in CD123+ BMB
@@ -533,11 +532,12 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     row_max_cd_fold = row_max_cd_title + 1
     ws.merge_cells(start_row=row_max_cd_fold, start_column=2, end_row=row_max_cd_fold, end_column=3)
     ws.cell(row=row_max_cd_fold, column=2, value="fold change")
+
     for col_idx, grp in zip(cols, cohort_names + ["__OVERALL__"]):
         keys = ok_keys if grp == "__OVERALL__" else set(cohorts[grp])
         ws.cell(row=row_max_cd_fold, column=col_idx, value=max_fold_reduction_product(keys)).alignment = Alignment(horizontal="center")
 
-    # Merge Column A from A3 down to the last C row of the CD123 section
+    # === Merge Column A from A3 down to the last C row of the CD123 section ===
     last_c_row = row_cd_title + max(n_vis, 1)
     ws.merge_cells(start_row=3, start_column=1, end_row=last_c_row, end_column=1)
     ws["A3"].value = "Bone Marrow\nBlasts"
@@ -556,37 +556,31 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
     ws.cell(row=tp53_start,   column=2, value="Total TP53 Mutated Pts")
     ws.cell(row=tp53_start+1, column=3, value="Overall count, average VAF (%)")
 
-    col_tp53 = find_col(input_df, ["TP53FINALRESULT","TP53 FINAL RESULT","TP53FINALRESULT__"])  # tolerate weird headers
+    col_tp53 = find_col(input_df, ["TP53FINALRESULT","TP53 FINAL RESULT"])
     def _mutated_count_text(keys: set) -> str:
         if not col_tp53:
             return "0 (-)"
-        sub_all = input_df[input_df[col_subject].map(_keyize_id).isin(keys)].copy()
-        sub_all = sub_all[~sub_all[col_visit].map(is_excluded_visit)]
-
-        # keep only subjects with ≥1 valid C#D# non-baseline visit
+        sub = input_df[input_df[col_subject].map(_keyize_id).isin(keys)].copy()
+        sub = sub[~sub[col_visit].map(is_excluded_visit)]
         keep_keys = set()
-        for k, g in sub_all.groupby(sub_all[col_subject].map(_keyize_id)):
+        for k, g in sub.groupby(sub[col_subject].map(_keyize_id)):
             if has_valid_timepoint_nonbaseline(g[col_visit]):
                 keep_keys.add(k)
         if not keep_keys:
             return "0 (-)"
-
         sub = input_df[input_df[col_subject].map(_keyize_id).isin(keep_keys)].copy()
-        lab = sub[col_tp53].astype(str).str.replace("\u00A0"," ").str.strip().str.lower()
-        # be slightly permissive on labels
-        mutated_mask = lab.str.fullmatch(r"(positive|pos|detected)")
-        mutated_keys = set(sub.loc[mutated_mask, col_subject].map(_keyize_id).dropna().unique().tolist())
+        sub["_TP53"] = sub[col_tp53].astype(str).str.replace("\u00A0"," ").str.strip().str.lower()
+        mutated_keys = set(sub.loc[sub["_TP53"].eq("positive"), col_subject].map(_keyize_id).dropna().unique().tolist())
         if not mutated_keys:
             return "0 (-)"
-
-        # average across all TP53VAF* values from mutated subjects
-        _, vaf_cols, _ = _detect_mut_and_vaf_cols(input_df)
+        dna_cols, vaf_cols, idxs = _detect_mut_and_vaf_cols(input_df)
         vafs = []
-        if vaf_cols:
-            sub2 = input_df[input_df[col_subject].map(_keyize_id).isin(mutated_keys)].copy()
-            for vc in vaf_cols:
-                vals = pd.to_numeric(sub2[vc].map(_to_percent), errors="coerce").dropna().tolist()
-                vafs.extend(vals)
+        for vc in vaf_cols:
+            vals = pd.to_numeric(
+                sub.loc[sub[col_subject].map(_keyize_id).isin(mutated_keys), vc].map(_to_percent),
+                errors="coerce"
+            ).dropna().tolist()
+            vafs.extend(vals)
         if not vafs:
             return f"{len(mutated_keys)} (-)"
         mean_v = round(sum(vafs)/len(vafs), 1)
@@ -611,71 +605,50 @@ def generate_fda_combo_excel(input_path: str, dose_path: str, tp53_dict_path: Op
         per_cohort_mut[grp] = _mut_df(set(cohorts[grp]))
     per_cohort_mut["__OVERALL__"] = _mut_df(ok_keys)
 
-    # ---- Generic writer for a 2-row category block ----
-    def _append_category_block(start_row: int, label_b: str, label_c: str, mask_builder) -> int:
+    def _append_category_block(start_row: int, label_b: str, label_c: str,
+                               mask_builder) -> int:
         ws.cell(row=start_row,   column=2, value=label_b)
         ws.cell(row=start_row+1, column=3, value=label_c)
         for col_idx, grp in zip(cols, cohort_names + ["__OVERALL__"]):
             dfm = per_cohort_mut.get(grp)
-            if dfm is None or dfm.empty:
-                text = "0 (-)"
-            else:
-                mask = mask_builder(dfm)
-                # If mask length mismatches (e.g., empty), guard it
-                if mask is None or len(mask) != len(dfm):
-                    text = "0 (-)"
-                else:
-                    text = _count_mean_text(dfm, mask)
+            mask = mask_builder(dfm) if dfm is not None and not dfm.empty else pd.Series([], dtype=bool)
+            text = _count_mean_text(dfm, mask)
             ws.cell(row=start_row+1, column=col_idx, value=text).alignment = Alignment(horizontal="center")
         return start_row + 2
 
-    # ---- Missense block ----
+    # ---- Missense ----
     row_ptr = tp53_start + 2
     row_ptr = _append_category_block(
         start_row=row_ptr,
         label_b="Mutation Type (Missense)",
         label_c="Count, average VAF (%)",
-        mask_builder=lambda df: df["Effect"].astype(str).str.lower().eq("missense")
+        mask_builder=lambda df: (df["Effect"].astype(str).str.lower() == "missense")
     )
 
-    # ---- Truncating block (FS, nonsense, splice) ----
+    # ---- Truncating (FS, nonsense, splice) ----
     trunc_set = {"fs","nonsense","splice"}
     row_ptr = _append_category_block(
         start_row=row_ptr,
         label_b="Mutation Type (Truncating)",
         label_c="Count, average VAF (%)",
-        mask_builder=lambda df: df["Effect"].astype(str).str.lower().isin(trunc_set)
+        mask_builder=lambda df: (df["Effect"].astype(str).str.lower().isin(trunc_set))
     )
 
-    # ---- Hotspot block ----
+    # ---- Hotspot ----
     hotspot_label_c = "Arg175, Gly245, Arg248, Arg249, Arg273, or Arg282\nCount, average VAF (%)"
     row_ptr = _append_category_block(
         start_row=row_ptr,
         label_b="Hotspot Mutations",
         label_c=hotspot_label_c,
-        mask_builder=lambda df: df["Hotspot"].astype(str).str.lower().eq("yes")
+        mask_builder=lambda df: (df["Hotspot"].astype(str).str.lower() == "yes")
     )
 
-    # ---- High VAF ≥40% ----
-    row_ptr = _append_category_block(
-        start_row=row_ptr,
-        label_b="High VAF Clones ≥40%",
-        label_c="Count, average VAF (%)",
-        mask_builder=lambda df: pd.to_numeric(df["vaf"], errors="coerce").ge(40.0)
-    )
+    # (No borders by design)
 
-    # ---- Low VAF <40% ----
-    row_ptr = _append_category_block(
-        start_row=row_ptr,
-        label_b="Low VAF Clones <40%",
-        label_c="Count, average VAF (%)",
-        mask_builder=lambda df: pd.to_numeric(df["vaf"], errors="coerce").lt(40.0)
-    )
-
-    # widths
+    # basic widths; Excel will auto-height on open because of wrap_text
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 36
+    ws.column_dimensions["C"].width = 32
     for c in cols:
         ws.column_dimensions[get_column_letter(c)].width = 22
 
