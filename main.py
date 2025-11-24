@@ -9,7 +9,13 @@ from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 ALLOWED_ANY_DATA = [("Data files", "*.csv *.tsv *.xlsx *.xls *.json"), ("All files", "*.*")]
-
+if getattr(sys, "frozen", False) and sys.platform == "darwin":
+    meipass = sys._MEIPASS
+    tcl = os.path.join(meipass, "tcl8.6")
+    tk  = os.path.join(meipass, "tk8.6")
+    if os.path.isdir(tcl) and os.path.isdir(tk):
+        os.environ["TCL_LIBRARY"] = tcl
+        os.environ["TK_LIBRARY"]  = tk
 # ----------------- header/IO helpers -----------------
 def normalize_header(name: str) -> str:
     s = str(name).replace("\u00A0", " ")
