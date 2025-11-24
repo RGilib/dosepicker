@@ -2,13 +2,12 @@
 name: Build macOS arm64 app
 
 on:
-  workflow_dispatch:        # manual "Run workflow"
+  workflow_dispatch:
   push:
-    tags: ["v*"]            # build when you tag e.g. v1.0.0
+    tags: ["v*"]
 
 jobs:
   macos-arm64:
-    # Apple Silicon runner (arm64). macos-14/15 are Apple Silicon.
     runs-on: macos-14
 
     steps:
@@ -23,38 +22,53 @@ jobs:
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
-          # pin a known-good PyInstaller on macOS 14 arm64
           pip install pyinstaller==6.10.0
           pip install -r requirements.txt
 
-      - name: Locate Tcl/Tk inside runner's Python (for Tkinter)
+      - name: Locate Tcl/Tk (supports python.org layout or system frameworks)
         id: tcltk
         run: |
           python - <<'PY'
-          import tkinter, pathlib, json
-          root = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
-          tcl = (root / "tcl8.6").resolve()
-          tk  = (root / "tk8.6").resolve()
-          print("TCL:", tcl)
-          print("TK :", tk)
-          pathlib.Path("tcltk.json").write_text(
-              json.dumps({"tcl": str(tcl), "tk": str(tk)})
-          )
+          import json, pathlib, tkinter, sys
+
+          def candidates():
+              # 1) python.org layout: .../lib/python3.11/tcl/{tcl8.6,tk8.6}
+              root = pathlib.Path(tkinter.__file__).resolve().parents[1] / "tcl"
+              yield root / "tcl8.6", root / "tk8.6"
+              # 2) System frameworks (common on GitHub macOS runners)
+              sys_tcl = pathlib.Path("/Library/Frameworks/Tcl.framework/Versions/8.6/Resources/Scripts")
+              sys_tk  = pathlib.Path("/Library/Frameworks/Tk.framework/Versions/8.6/Resources/Scripts")
+              yield sys_tcl / "tcl8.6", sys_tk / "tk8.6"
+
+          found = None
+          tried = []
+          for tcl8, tk8 in candidates():
+              tried.append((str(tcl8), str(tk8)))
+              if tcl8.is_dir() and tk8.is_dir():
+                  found = {"tcl8": str(tcl8), "tk8": str(tk8)}
+                  break
+
+          if not found:
+              msg = "Tcl/Tk 8.6 not found. Tried:\n" + "\n".join([f"TCL={a}  TK={b}" for a,b in tried])
+              raise SystemExit(msg)
+
+          print("Using Tcl/Tk:", found)
+          pathlib.Path("tcltk.json").write_text(json.dumps(found))
           PY
 
       - name: Build .app with PyInstaller (bundle Tcl/Tk)
         run: |
-          TCL=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl"])')
-          TK=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk"])')
+          TCL8=$(python -c 'import json; print(json.load(open("tcltk.json"))["tcl8"])')
+          TK8=$(python -c 'import json; print(json.load(open("tcltk.json"))["tk8"])')
 
-          pyinstaller --windowed --name "FDACombo" \
+          pyinstaller --noconfirm --windowed --name "FDACombo" \
             --icon a9qqs-dnvbm.icns \
             --collect-all pandas \
             --collect-all openpyxl \
             --hidden-import=tkinter \
             --hidden-import=_tkinter \
-            --add-data "$TCL:tcl8.6" \
-            --add-data "$TK:tk8.6" \
+            --add-data "$TCL8:tcl8.6" \
+            --add-data "$TK8:tk8.6" \
             main.py
 
           file "dist/FDACombo.app/Contents/MacOS/FDACombo"
